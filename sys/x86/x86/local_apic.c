@@ -230,11 +230,11 @@ static struct lvt elvts[] = {
 		.lvt_edgetrigger = 1,
 		.lvt_activehi = 1,
 		.lvt_masked = 1,
-		.lvt_active = 0,
-		.lvt_mode = APIC_LVT_DM_FIXED,
+		.lvt_active = 1,
+		.lvt_mode = APIC_LVT_DM_NMI,
 		.lvt_vector = 0,
 		.lvt_reg = LAPIC_EXT_LVT0,
-		.lvt_desc = "ELVT0",
+		.lvt_desc = "IBS",
 	},
 	[APIC_ELVT_MCA] = {
 		.lvt_edgetrigger = 1,
@@ -528,7 +528,10 @@ elvt_mode(struct lapic *la, u_int idx, uint32_t value)
 	KASSERT(idx <= APIC_ELVT_MAX,
 	    ("%s: idx %u out of range", __func__, idx));
 
-	elvt = &la->la_elvts[idx];
+	if (la->la_elvts[idx].lvt_active)
+	    elvt = &la->la_elvts[idx];
+	else
+	    elvt = &elvts[idx];
 	KASSERT(elvt->lvt_active, ("%s: ELVT%u is not active", __func__, idx));
 	KASSERT(elvt->lvt_edgetrigger,
 	    ("%s: ELVT%u is not edge triggered", __func__, idx));
@@ -963,9 +966,16 @@ lapic_reenable_pcint(void)
 
 	if (refcount_load(&pcint_refcnt) == 0)
 		return;
+
 	value = lapic_read32(LAPIC_LVT_PCINT);
 	value &= ~APIC_LVT_M;
 	lapic_write32(LAPIC_LVT_PCINT, value);
+
+	if ((amd_feature2 & AMDID2_IBS) != 0) {
+		value = lapic_read32(LAPIC_EXT_LVT0);
+		value &= ~APIC_LVT_M;
+		lapic_write32(LAPIC_EXT_LVT0, value);
+	}
 }
 
 static void
@@ -976,6 +986,11 @@ lapic_update_pcint(void *dummy)
 	la = &lapics[lapic_id()];
 	lapic_write32(LAPIC_LVT_PCINT, lvt_mode(la, APIC_LVT_PMC,
 	    lapic_read32(LAPIC_LVT_PCINT)));
+
+	if ((amd_feature2 & AMDID2_IBS) != 0) {
+		lapic_write32(LAPIC_EXT_LVT0, elvt_mode(la, APIC_ELVT_IBS,
+		    lapic_read32(LAPIC_EXT_LVT0)));
+	}
 }
 
 void
@@ -1022,6 +1037,9 @@ lapic_enable_pcint(void)
 		return (1);
 	lvts[APIC_LVT_PMC].lvt_masked = 0;
 
+	if ((amd_feature2 & AMDID2_IBS) != 0)
+		elvts[APIC_ELVT_IBS].lvt_masked = 0;
+
 	MPASS(mp_ncpus == 1 || smp_started);
 	smp_rendezvous(NULL, lapic_update_pcint, NULL, NULL);
 	return (1);
@@ -1045,6 +1063,7 @@ lapic_disable_pcint(void)
 	if (!refcount_release(&pcint_refcnt))
 		return;
 	lvts[APIC_LVT_PMC].lvt_masked = 1;
+	elvts[APIC_ELVT_IBS].lvt_masked = 1;
 
 #ifdef SMP
 	/* The APs should always be started when hwpmc is unloaded. */
@@ -1443,21 +1462,8 @@ lapic_handle_timer(struct trapframe *frame)
 	kmsan_mark(frame, sizeof(*frame), KMSAN_STATE_INITED);
 	trap_check_kstack();
 
-#if defined(SMP) && !defined(SCHED_ULE)
-	/*
-	 * Don't do any accounting for the disabled HTT cores, since it
-	 * will provide misleading numbers for the userland.
-	 *
-	 * No locking is necessary here, since even if we lose the race
-	 * when hlt_cpus_mask changes it is not a big deal, really.
-	 *
-	 * Don't do that for ULE, since ULE doesn't consider hlt_cpus_mask
-	 * and unlike other schedulers it actually schedules threads to
-	 * those CPUs.
-	 */
-	if (CPU_ISSET(PCPU_GET(cpuid), &hlt_cpus_mask))
+	if (!sched_do_timer_accounting())
 		return;
-#endif
 
 	/* Look up our local APIC structure for the tick counters. */
 	la = &lapics[PCPU_GET(apic_id)];
